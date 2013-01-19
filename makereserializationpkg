@@ -1,0 +1,259 @@
+#!/usr/bin/env python
+# encoding: utf-8
+#
+# Copyright 2012 Greg Neagle.
+#
+# Licensed under the Apache License, Version 2.0 (the 'License');
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an 'AS IS' BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+makereserializationpkg.py
+
+Created by Greg Neagle on 2013-01-18.
+"""
+
+import sys
+import os
+
+import optparse
+import plistlib
+import shutil
+import subprocess
+import tempfile
+
+
+# dmg helpers
+def mountdmg(dmgpath):
+    """
+    Attempts to mount the dmg at dmgpath
+    and returns a list of mountpoints
+    """
+    mountpoints = []
+    dmgname = os.path.basename(dmgpath)
+    cmd = ['/usr/bin/hdiutil', 'attach', dmgpath,
+                '-mountRandom', TMPDIR, '-nobrowse', '-plist',
+                '-owners', 'off']
+    proc = subprocess.Popen(cmd, bufsize=-1, 
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (pliststr, err) = proc.communicate()
+    if proc.returncode:
+        print >> sys.stderr, 'Error: "%s" while mounting %s.' % (err, dmgname)
+    if pliststr:
+        plist = plistlib.readPlistFromString(pliststr)
+        for entity in plist['system-entities']:
+            if 'mount-point' in entity:
+                mountpoints.append(entity['mount-point'])
+
+    return mountpoints
+
+
+def unmountdmg(mountpoint):
+    """
+    Unmounts the dmg at mountpoint
+    """
+    proc = subprocess.Popen(['/usr/bin/hdiutil', 'detach', mountpoint],
+                                bufsize=-1, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+    (unused_output, err) = proc.communicate()
+    if proc.returncode:
+        print >> sys.stderr, 'Polite unmount failed: %s' % err
+        print >> sys.stderr, 'Attempting to force unmount %s' % mountpoint
+        # try forcing the unmount
+        retcode = subprocess.call(['/usr/bin/hdiutil', 'detach', mountpoint,
+                                '-force'])
+        if retcode:
+            print >> sys.stderr, 'Failed to unmount %s' % mountpoint
+
+
+def writefile(stringdata, path):
+    '''Writes string data to path.'''
+    fileobject = open(path, mode='w', buffering=1)
+    print >> fileobject, stringdata
+    fileobject.close()
+
+
+def downloadURL(URL, to_file=None):
+    '''Downloads URL to the current directory or as string'''
+    cmd = ['/usr/bin/curl', '--silent', '--show-error', '--url', URL]
+    if to_file:
+        cmd.extend(['-o', to_file])
+    proc = subprocess.Popen(cmd, shell=False, bufsize=-1,
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    (output, err) = proc.communicate()
+    if proc.returncode:
+        print >> sys.stderr, 'Error %s retrieving %s' % (proc.returncode, URL)
+        print >> sys.stderr, err
+        return None
+    if to_file:
+        return to_file
+    else:
+        return output
+
+
+def cleanup_and_exit(returncode=0):
+    '''Cleanup our TMPDIR'''
+    if TMPDIR:
+        shutil.rmtree(TMPDIR, ignore_errors=True)
+    sys.exit(returncode)
+
+
+
+TMPDIR = None
+def main():
+    '''Builds a package with Adobe's APTEE tool to reserialize a CS6 product.'''
+    global TMPDIR
+    
+    usage = ('Usage: %prog --leid <PRODUCT_ID>\n'
+        '                                 --serial <SERIALNUMBER>\n'
+        '                                 [--identifier com.example.reserializer]\n'
+        '                                 [--version 1.0]\n'
+        '                                 package_pathname\n\n'
+        '    %prog creates a package that will reserialize the Adobe\n'
+        '    product specified by <PRODUCT_ID> with <SERIALNUMBER>.\n'
+        '    Created package is saved to package_pathname.\n')
+
+    parser = optparse.OptionParser(usage=usage)
+    parser.add_option('--leid',
+        help='Adobe product ID. See '   
+        'http://www.adobe.com/devnet/creativesuite/enterprisedeployment/'
+        'licensing-identifiers.html for a list of product IDs.')
+    parser.add_option('--serial', 
+        help='Serial number to use.')
+    parser.add_option('--identifier', '--id', 
+        default='com.example.reserializer.pkg',
+        help='Optional. Package identifier for the package. Defaults to '
+        '"com.example.reserializer.pkg"')
+    parser.add_option('--version',
+        default='1.0',
+        help='Optional. Version number for the generated package. Defaults to '
+        '"1.0".')
+    options, arguments = parser.parse_args()
+
+    if len(arguments) != 1:
+        print >> sys.stderr, (
+            'ERROR: Must have pathname for package to be created!')
+        parser.print_usage()
+        sys.exit(1)
+        
+    package_path = arguments[0]
+        
+    if not options.leid or not options.serial:
+        print >> sys.stderr, (
+            'ERROR: --leid and --serial are required!')
+        parser.print_usage()
+        sys.exit(1)
+        
+    # make sure we have pkgbuild
+    if not os.path.exists('/usr/bin/pkgbuild'):
+        print >> sys.stderr, (
+            'ERROR: /usr/bin/pkgbuild is required! '
+            'You may need to install Xcode 3.2.6 or later.')
+        sys.exit(1)
+        
+    TMPDIR = tempfile.mkdtemp(dir='/tmp')
+    
+    # download APTEE disk image
+    APTEE_DMG_URL = "http://download.macromedia.com/pub/developer/creativesuite/APTEE/Mac/Adobe_Provisioning_Toolkit_6_2_ALL.dmg"
+    dmg_path = os.path.join(TMPDIR, 'aptee.dmg')
+    print 'Downloading APTEE tool from Adobe...'
+    dmg_path = downloadURL(APTEE_DMG_URL, to_file=dmg_path)
+    if dmg_path:
+        print 'Download complete.'
+    else:
+        print >> sys.stderr, 'Download of %s failed.' % APTEE_DMG_URL
+        cleanup_and_exit(1)
+        
+    # mount APTEE disk image
+    print 'Mounting APTEE diskimage...'
+    mountpaths = mountdmg(dmg_path)
+    if not mountpaths:
+        print >> sys.stderr, 'Mount of %s failed.' % dmg_path
+        cleanup_and_exit(1)
+    
+    # make our scripts dir
+    scripts_dir = os.path.join(TMPDIR, 'scripts')
+    try:
+        os.mkdir(scripts_dir)
+    except OSError, err:
+        print >> sys.stderr, 'Could not create %s: %s.' % (scripts_dir, err)
+        cleanup_and_exit(1)
+        
+    # copy adobe_prtk tool
+    sourcepath = os.path.join(
+        mountpaths[0], 
+        'Adobe Provisioning Toolkit Enterprise Edition', 'adobe_prtk')
+    try:
+        shutil.copy(sourcepath, scripts_dir)
+    except IOError, err:
+        print >> sys.stderr, (
+            'Could not copy %s to %s: %s'% (sourcepath, scripts_dir, err))
+        unmountdmg(mountpaths[0])
+        cleanup_and_exit(1)
+    
+    # unmount APTEE dmg
+    unmountdmg(mountpaths[0])
+    
+    # create and write postinstall script
+    postinstall_script = '''#!/bin/sh
+
+LEID=%s
+SERIAL=%s
+
+SCRIPTDIR=`/usr/bin/dirname $0`
+
+"${SCRIPTDIR}/adobe_prtk" --tool=UnSerialize --leid="${LEID}"
+"${SCRIPTDIR}/adobe_prtk" --tool=Serialize --leid="${LEID}" --serial="${SERIAL}" --regsuppress=ss --eulasuppress
+''' % (options.leid, options.serial)
+
+    postinstall_script_path = os.path.join(scripts_dir, 'postinstall')
+    try:
+        writefile(postinstall_script, postinstall_script_path)
+        # make sure it's executable
+        subprocess.check_call(
+            ['/bin/chmod', 'a+x', postinstall_script_path])
+    except (OSError, subprocess.CalledProcessError), err:
+        print >> sys.stderr, 'Problem creating %s: %s.' % (
+                                postinstall_script_path, err)
+        cleanup_and_exit(1)
+        
+    # make an empty payload directory
+    # without this, installer won't leave a receipt
+    payload_dir = os.path.join(TMPDIR, 'empty')
+    try:
+        os.mkdir(payload_dir)
+    except OSError, err:
+        print >> sys.stderr, 'Could not create %s: %s.' % (payload_dir, err)
+        cleanup_and_exit(1)
+    
+    # make the package
+    try:
+        cmd = ['/usr/bin/pkgbuild', 
+               '--identifier', options.identifier,
+               '--version', options.version,
+               '--scripts', scripts_dir,
+               '--root', payload_dir,
+               '--install-location', '/private/tmp',
+               package_path
+               ]
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError, err:
+        print >> sys.stderr, 'Error creating package %s: %s.' % (
+                                postinstall_script_path, err)
+        cleanup_and_exit(1)
+
+    print 'Package creation complete at %s' % os.path.abspath(package_path)
+    cleanup_and_exit(0)
+
+
+if __name__ == '__main__':
+	main()
+
